@@ -82,43 +82,36 @@ sequenceDiagram
 
 ## 2. 模型结构图
 
-### 2.1 模型结构概览图
+### 2.1 LLM 场景模型结构概览图
 
-这张图先从整体上看 Qwen3.6-35B-A3B：它是一个多模态 MoE 模型，外层是 `Qwen3_5MoeForConditionalGeneration`，输入可以是文本、图片、视频；视觉输入先经过 vision encoder，最后和文本 token 一起进入 40 层语言模型。语言模型内部的核心是 hybrid attention + sparse MoE。
+这张图只关注 LLM 文本推理场景，不展开 image / video / vision tower。请求经过 tokenizer 得到 token ids 后，直接进入语言模型路径：`Qwen3_5ForCausalLM -> Qwen3_5Model -> 40 decoder layers -> lm_head -> sampler`。
 
 ```mermaid
 flowchart LR
-    Text["Text input<br/>tokens"]
-    Image["Image input<br/>image_token_id = 248056"]
-    Video["Video input<br/>video_token_id = 248057"]
+    Prompt["Text prompt"]
+    Tokenizer["Tokenizer / chat template"]
+    TokenIds["input_ids + positions"]
 
-    subgraph Model["Qwen3.6-35B-A3B<br/>Qwen3_5MoeForConditionalGeneration"]
-        Processor["Multimodal preprocessing<br/>chat template / processor"]
-        Vision["Vision encoder<br/>Qwen3_VisionTransformer<br/>27 layers"]
-        Embed["Text embedding<br/>hidden_size = 2048"]
-        Fusion["Multimodal token fusion<br/>vision embeddings + text embeddings"]
-        LLM["Language model<br/>40 decoder layers<br/>hidden_size = 2048"]
-        Head["LM head<br/>vocab_size = 248320"]
+    subgraph LLM["Qwen3.6 LLM path<br/>Qwen3_5ForCausalLM"]
+        Embed["Token embedding<br/>hidden_size = 2048"]
+        Stack["Qwen3_5Model<br/>40 decoder layers"]
+        FinalNorm["Final RMSNorm"]
+        Head["LM head + LogitsProcessor<br/>vocab_size = 248320"]
     end
 
     subgraph DecoderStack["Decoder stack overview"]
-        Hybrid["Hybrid attention pattern<br/>30 Gated DeltaNet layers<br/>10 Gated Attention layers"]
+        Pattern["10 repeated blocks<br/>3 x Gated DeltaNet layer<br/>1 x Gated Attention layer"]
+        Hybrid["Total attention mix<br/>30 Gated DeltaNet layers<br/>10 Gated Attention layers"]
         MoE["Sparse MoE FFN<br/>256 experts total<br/>8 routed + 1 shared active per token"]
-        OutputNorm["Final RMSNorm"]
     end
 
-    Text --> Processor
-    Image --> Processor
-    Video --> Processor
-    Processor --> Vision
-    Processor --> Embed
-    Vision --> Fusion
-    Embed --> Fusion
-    Fusion --> LLM
-    LLM --> DecoderStack
+    Sampler["Sampler<br/>next token"]
+    Output["Generated text"]
+
+    Prompt --> Tokenizer --> TokenIds --> Embed --> Stack --> FinalNorm --> Head --> Sampler --> Output
+    Stack --> DecoderStack
+    Pattern --> Hybrid
     Hybrid --> MoE
-    MoE --> OutputNorm
-    OutputNorm --> Head
 ```
 
 ### 2.2 按层展开的模型结构图
@@ -128,11 +121,9 @@ flowchart LR
 ```mermaid
 flowchart TB
     TextInput["Text tokens<br/>vocab_size = 248320"]
-    ImageVideo["Image / video tokens<br/>image_token_id / video_token_id"]
 
-    subgraph Wrapper["Qwen3_5MoeForConditionalGeneration"]
-        VisionTower["Vision encoder<br/>Qwen3_VisionTransformer<br/>depth = 27<br/>hidden_size = 1152<br/>out_hidden_size = 2048"]
-        LanguageModel["Language model<br/>Qwen3_5ForCausalLM<br/>architecture = Qwen3_5Moe"]
+    subgraph Wrapper["LLM wrapper<br/>Qwen3_5ForCausalLMBase / Qwen3_5MoeForCausalLM"]
+        LanguageModel["language model:<br/>Qwen3_5Model"]
     end
 
     subgraph LM["Language Model Body"]
@@ -170,8 +161,6 @@ flowchart TB
     end
 
     TextInput --> LanguageModel
-    ImageVideo --> VisionTower
-    VisionTower --> LanguageModel
     LanguageModel --> Embedding
     Embedding --> Stack
     Stack --> RepeatedBlocks
@@ -194,8 +183,8 @@ flowchart TB
 
 模型侧关键源码位置：
 
-- 模型 registry 把 `Qwen3_5MoeForConditionalGeneration` 映射到 `qwen3_5.py`：`vllm/model_executor/models/registry.py`
-- `Qwen3_5ForConditionalGeneration` / `Qwen3_5MoeForConditionalGeneration` 创建视觉塔和语言模型：`vllm/model_executor/models/qwen3_5.py`
+- 模型 registry 把 `Qwen3_5MoeForConditionalGeneration` 映射到 `qwen3_5.py`；LLM 文本推理时主要关注其中的 language model 路径：`vllm/model_executor/models/registry.py`
+- `Qwen3_5ForCausalLMBase` / `Qwen3_5MoeForCausalLM` 是 LLM 场景的核心入口：`vllm/model_executor/models/qwen3_5.py`
 - `Qwen3_5ForCausalLMBase` 创建 `Qwen3_5Model`，并定义 logits / weight loading：`vllm/model_executor/models/qwen3_5.py`
 - `Qwen3_5Model` 创建 embedding、decoder layers、final norm：`vllm/model_executor/models/qwen3_5.py`
 - `Qwen3_5DecoderLayer` 根据 `layer_type` 选择 `GatedDeltaNetAttention` 或 `Qwen3NextAttention`：`vllm/model_executor/models/qwen3_5.py`
@@ -209,7 +198,7 @@ flowchart TB
 
 第一张图强调“框架侧”：vLLM 仍然负责 engine、scheduler、model loading 和请求调度；vllm-ascend 通过 plugin/platform 机制把 worker、attention backend、custom ops 换成 Ascend 实现。
 
-第二张图强调“模型侧”：Qwen3.6-35B-A3B 是 `Qwen3_5MoeForConditionalGeneration`，语言模型是 40 层 sparse MoE hybrid architecture。它的 `layer_types` 不是简单交替，而是每 4 层一个周期：前 3 层是 `linear_attention`，第 4 层是 `full_attention`，整体重复 10 次。因此共有 30 层 Gated DeltaNet 和 10 层 Gated Attention。
+模型图强调 LLM 文本推理路径：虽然模型配置的顶层 architecture 可以是 `Qwen3_5MoeForConditionalGeneration`，但纯文本生成时核心执行链路是内部的 `Qwen3_5ForCausalLM / Qwen3_5MoeForCausalLM`。语言模型是 40 层 sparse MoE hybrid architecture。它的 `layer_types` 不是简单交替，而是每 4 层一个周期：前 3 层是 `linear_attention`，第 4 层是 `full_attention`，整体重复 10 次。因此共有 30 层 Gated DeltaNet 和 10 层 Gated Attention。
 
 每一层 attention 后面都接 sparse MoE FFN。MoE 总专家数是 256，每个 token 激活 8 个 routed experts，加上 1 个 shared expert；这也是 `35B total / 3B activated` 的核心来源之一。
 
